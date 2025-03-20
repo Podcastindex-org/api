@@ -1,0 +1,16 @@
+[package]
+name = "api"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bacon = "3.10.0"
+color-eyre = "0.6.3"
+poem = "3.1.7"
+poem-openapi = {  version = "5.1.8" , features = ["swagger-ui"]}
+sqlx = {  version = "0.8.3", features = ["runtime-async-std","mysql"]}
+tokio = {  version = "1.43.0" , features = ["full"]}
+tracing = "0.1.41"
+log = "0.4.26"
+async-std = "1.13.1"
+dotenv = "0.15.0"
