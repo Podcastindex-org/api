@@ -1,13 +1,14 @@
-use poem::{listener::TcpListener, EndpointExt, Route, web::Data};
+use poem::{listener::TcpListener, EndpointExt, Route, web::Data, Request};
 use poem_openapi::{param::Query, payload::PlainText, OpenApi, OpenApiService, SecurityScheme};
-use poem_openapi::auth::{ApiKey, Basic};
+use poem_openapi::auth::{ApiKey};
 use sqlx::{Pool, MySql, Error, FromRow};
 use sqlx::mysql::{MySqlPool};
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::{sync::Mutex, collections::HashMap};
+use once_cell::sync::Lazy;
 use dotenv::dotenv;
 use std::env;
-use std::process::exit;
+use std::io::ErrorKind;
+use poem::http::StatusCode;
 
 #[derive(Clone)]
 struct AppConfig {
@@ -16,7 +17,6 @@ struct AppConfig {
     db_name: String,
     db_user: String,
     db_password: String,
-    memcache_api_tokens: Arc<HashMap<String, String>>,
 }
 #[derive(FromRow)]
 struct PiApiToken {
@@ -31,7 +31,7 @@ struct PiApiToken {
 }
 
 #[derive(SecurityScheme)]
-#[oai(ty = "api_key", key_name = "Authorization", key_in = "header")]
+#[oai(ty = "api_key", key_name = "Authorization", key_in = "header", checker = "auth_checker")]
 struct MySecurityScheme1(ApiKey);
 
 #[derive(SecurityScheme)]
@@ -39,6 +39,10 @@ enum MySecurityScheme {
     MySecurityScheme1(MySecurityScheme1),
 }
 
+static GLOBAL_MAP: Lazy<Mutex<HashMap<String, String>>> = Lazy::new(|| {
+    let mut m = HashMap::new();
+    Mutex::new(m)
+});
 
 struct Api;
 #[OpenApi]
@@ -47,15 +51,9 @@ impl Api {
     async fn hello(
         &self,
         state: Data<&AppConfig>,
-        auth: MySecurityScheme,
+        _auth: MySecurityScheme,
     ) -> PlainText<String>
     {
-        match auth {
-            MySecurityScheme::MySecurityScheme1(auth) => {
-                println!("{}", auth.0.key)
-            }
-        }
-
         match db_connect(state.clone()).await {
             Ok(_) => {
                 println!("Connected to database");
@@ -64,14 +62,14 @@ impl Api {
                 eprintln!("Error connecting to database: {}", err);
             }
         }
-        PlainText(format!("hello, world! {}", state.memcache_api_tokens.len()))
+        PlainText(format!("hello, world!"))
     }
 
     #[oai(path = "/goodbye", method = "get")]
     async fn goodbye(
         &self,
         state: Data<&AppConfig>,
-        auth: MySecurityScheme,
+        _auth: MySecurityScheme,
         name: Query<Option<String>>,
     ) -> PlainText<String>
     {
@@ -98,17 +96,14 @@ async fn main() -> Result<(), std::io::Error> {
         db_name: "".to_string(),
         db_user: "".to_string(),
         db_password: "".to_string(),
-        memcache_api_tokens: Arc::new(HashMap::new()),
     };
     load_app_config(&mut app_config);
 
     //Load the guid lookup table
-    let mut kv_api_keys: HashMap<String, String> = HashMap::new();
-    if refresh_kv_apikeys(app_config.clone(), &mut kv_api_keys).await.is_err() {
+    if refresh_kv_apikeys(app_config.clone()).await.is_err() {
         eprintln!("Could not load the guid list from file.");
         std::process::exit(1);
     }
-    let memcache_api_keys: Arc<HashMap<String, String>> = Arc::new(kv_api_keys);
 
     let api_service =
         OpenApiService::new(
@@ -118,10 +113,8 @@ async fn main() -> Result<(), std::io::Error> {
         ).server("http://localhost:3000/api");
     let ui = api_service.swagger_ui();
 
-    app_config.memcache_api_tokens = Arc::clone(&memcache_api_keys);
-
     let app = Route::new()
-        .nest("/api", api_service)
+        .nest("/api/2.0", api_service)
         .data(app_config);
 
 
@@ -183,10 +176,9 @@ async fn db_connect(app_config: AppConfig) -> Result<Pool<MySql>, Error> {
 }
 
 async fn refresh_kv_apikeys(
-    app_config: AppConfig,
-    kv_api_keys: &mut HashMap<String, String>,
+    app_config: AppConfig
 )
-    -> Result<&mut HashMap<String, String>, std::io::Error>
+    -> Result<bool, std::io::Error>
 {
     match db_connect(app_config).await {
         Ok(pool) => {
@@ -203,13 +195,25 @@ async fn refresh_kv_apikeys(
                          &api_token.userid,
                          String::from_utf8(api_token.keyval.clone()).unwrap(),
                 );
-                kv_api_keys.insert(
-                    String::from_utf8(api_token.keyval.clone()).unwrap(),
-                    String::from_utf8(api_token.secretval.clone()).unwrap(),
-                );
+
+                let keyval = String::from_utf8(api_token.keyval.clone()).unwrap();
+                let secretval = String::from_utf8(api_token.secretval.clone()).unwrap();
+
+                let global_map = GLOBAL_MAP.lock();
+                match global_map {
+                    Ok(mut map) => {
+                        map.insert(
+                            keyval,
+                            secretval,
+                        );
+                    }
+                    Err(_) => {
+                        return Err(std::io::Error::new(ErrorKind::Other, "oh no!"));
+                    }
+                }
             }
 
-            Ok(kv_api_keys)
+            Ok(true)
         }
         Err(err) => {
             eprintln!("Error connecting to database: {}", err);
@@ -218,34 +222,33 @@ async fn refresh_kv_apikeys(
     }
 }
 
-//Take a csv list of guid/url combos and load them into a passed in by ref hashmap
-//Return true/false on success or failure
-// fn load_guid_table(guid_table: &mut HashMap<String, String>) -> Result<bool, Error> {
-//     let mut rdr = csv::Reader::from_path("guids.csv")?;
-//
-//     //Show spinner on terminal while this loads cause it's big
-//     let mut sp = Spinner::new(Spinners::Dots9, "Loading guid records...".into());
-//
-//     //Load each csv record into the hashmap
-//     for result in rdr.records() {
-//         let record = result?;
-//
-//         let guid = record.get(1).unwrap().to_string().replace("-", "");
-//         let url = record.get(2).unwrap().to_string();
-//
-//         //println!("{:?} - {:?}", guid, url);
-//         guid_table.insert(
-//             guid,
-//             url
-//         );
-//     }
-//
-//     //Stop the spinner
-//     sp.stop();
-//     println!("Done");
-//
-//     Ok(true)
-// }
+async fn auth_checker(request: &&Request, api_key: ApiKey) -> poem::Result<ApiKey> {
+    println!("Checking auth: [{:#?}].", api_key);
+
+    let global_map = GLOBAL_MAP.lock();
+    match global_map {
+        Ok(mut map) => {
+            if map.get(&api_key.key).is_some() {
+                Ok(ApiKey::from(api_key))
+            } else {
+                Err(
+                    poem::error::Error::from_string(
+                        "Api token not found.",
+                        StatusCode::UNAUTHORIZED,
+                    )
+                )
+            }
+        }
+        Err(_) => {
+            Err(
+                poem::error::Error::from_string(
+                    "Api token not found.",
+                    StatusCode::UNAUTHORIZED,
+                )
+            )
+        }
+    }
+}
 
 #[allow(dead_code)]
 fn print_type_of<T>(_: &T) {
