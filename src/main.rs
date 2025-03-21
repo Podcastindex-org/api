@@ -9,6 +9,8 @@ use dotenv::dotenv;
 use std::env;
 use std::io::ErrorKind;
 use poem::http::StatusCode;
+use std::thread::{sleep, spawn};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Clone)]
 struct AppConfig {
@@ -99,11 +101,21 @@ async fn main() -> Result<(), std::io::Error> {
     };
     load_app_config(&mut app_config);
 
-    //Load the guid lookup table
+    //Load the api key lookup table
     if refresh_kv_apikeys(app_config.clone()).await.is_err() {
         eprintln!("Could not load the guid list from file.");
         std::process::exit(1);
     }
+
+    let thread_config = app_config.clone();
+    tokio::spawn(async move {
+        loop {
+            sleep(Duration::from_secs(300));
+
+            //Refresh the api key lookup table
+            refresh_kv_apikeys(thread_config.clone()).await;
+        }
+    });
 
     let api_service =
         OpenApiService::new(
