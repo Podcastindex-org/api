@@ -254,7 +254,7 @@ async fn auth_checker(request: &&Request, api_key: ApiKey) -> poem::Result<ApiKe
         Err(_) => {
             Err(
                 poem::error::Error::from_string(
-                    "Api token not found.",
+                    "Error accessing api key lookup table.",
                     StatusCode::UNAUTHORIZED,
                 )
             )
